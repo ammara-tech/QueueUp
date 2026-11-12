@@ -1,0 +1,143 @@
+rules_version = '2';
+
+// QueueUp's security rules: who can read and change what. Paste them into
+// Firebase → Firestore Database → Rules, and press Publish.
+//
+// - Anyone can see a queue's public part: its name, whether it's open, the numbers waiting and
+//   the number being served. Names are never in it.
+// - Only the owner changes their queue. A customer (with a guest account) can do exactly two
+//   things to it: take the next number, and take their own number out of the line.
+// - A ticket (with a name) can only be read by the owner and the customer who took it.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function shopPath(shopId) {
+      return /databases/$(database)/documents/shops/$(shopId);
+    }
+    function ticketPath(shopId, ticketId) {
+      return /databases/$(database)/documents/shops/$(shopId)/tickets/$(ticketId);
+    }
+    function ownsShop(shopId) {
+      return signedIn() && get(shopPath(shopId)).data.ownerId == request.auth.uid;
+    }
+
+    // A whole queue, as the owner saves it
+    function validShop(d) {
+      return d.keys().hasOnly(['ownerId', 'name', 'kind', 'code', 'open', 'note', 'minutesEach', 'avgMinutes',
+                                'nextNumber', 'waiting', 'serving', 'lastJoin', 'lastLeave', 'day', 'createdAt'])
+        && d.ownerId is string
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 40
+        && d.kind in ['barber', 'salon', 'clinic', 'shop', 'office', 'other']
+        && d.code is string && d.code.size() == 6
+        && d.open is bool
+        && d.note is string && d.note.size() <= 120
+        && d.minutesEach is int && d.minutesEach >= 1 && d.minutesEach <= 120
+        && d.avgMinutes is number && d.avgMinutes >= 0 && d.avgMinutes <= 120
+        && d.nextNumber is int && d.nextNumber >= 1 && d.nextNumber <= 10000
+        && d.waiting is list && d.waiting.size() <= 300
+        && (d.serving == null || d.serving is int)
+        && d.lastJoin is string && d.lastJoin.size() <= 40
+        && d.lastLeave is string && d.lastLeave.size() <= 40
+        && d.day is string && d.day.size() == 10
+        && d.createdAt is number;
+    }
+
+    // A customer taking the next number: the number goes up by one, it's added to the end of the
+    // line, and the ticket with that number (made in the same step) is theirs. Only while open.
+    function isJoin(shopId) {
+      let before = resource.data;
+      let after = request.resource.data;
+      let ticket = getAfter(ticketPath(shopId, after.lastJoin)).data;
+      return after.diff(before).affectedKeys().hasOnly(['nextNumber', 'waiting', 'lastJoin'])
+        && before.open == true
+        && before.waiting.size() < 300
+        && after.nextNumber == before.nextNumber + 1
+        && after.waiting == before.waiting.concat([before.nextNumber])
+        && ticket.uid == request.auth.uid
+        && ticket.number == before.nextNumber;
+    }
+
+    // A customer leaving: only their own number comes out of the line, in the same step as their
+    // ticket changes from waiting to left
+    function isLeave(shopId) {
+      let before = resource.data;
+      let after = request.resource.data;
+      let ticketBefore = get(ticketPath(shopId, after.lastLeave)).data;
+      let ticketAfter = getAfter(ticketPath(shopId, after.lastLeave)).data;
+      return after.diff(before).affectedKeys().hasOnly(['waiting', 'lastLeave'])
+        && ticketAfter.uid == request.auth.uid
+        && ticketBefore.status == 'waiting'
+        && ticketAfter.status == 'left'
+        && after.waiting == before.waiting.removeAll([ticketAfter.number]);
+    }
+
+    match /shops/{shopId} {
+      allow get: if true;
+      allow list: if signedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if signedIn() && validShop(request.resource.data) && request.resource.data.ownerId == request.auth.uid;
+      allow update: if signedIn() && (
+        (resource.data.ownerId == request.auth.uid
+          && request.resource.data.ownerId == resource.data.ownerId
+          && validShop(request.resource.data))
+        || isJoin(shopId)
+        || isLeave(shopId));
+      allow delete: if signedIn() && resource.data.ownerId == request.auth.uid;
+
+      match /tickets/{ticketId} {
+        function validTicket(d) {
+          return d.keys().hasOnly(['number', 'name', 'uid', 'walkIn', 'status', 'joinedAt', 'calledAt', 'doneAt'])
+            && d.number is int && d.number >= 1
+            && d.name is string && d.name.size() <= 30
+            && d.uid is string
+            && d.walkIn is bool
+            && d.status in ['waiting', 'called', 'served', 'noshow', 'left']
+            && d.joinedAt is number && d.calledAt is number && d.doneAt is number;
+        }
+
+        allow read: if signedIn() && (resource.data.uid == request.auth.uid || ownsShop(shopId));
+
+        allow create: if signedIn() && validTicket(request.resource.data) && (
+          ownsShop(shopId)
+          || (request.resource.data.uid == request.auth.uid
+            && request.resource.data.walkIn == false
+            && request.resource.data.status == 'waiting'
+            && request.resource.data.calledAt == 0
+            && request.resource.data.doneAt == 0
+            && request.resource.data.number == get(shopPath(shopId)).data.nextNumber
+            && getAfter(shopPath(shopId)).data.lastJoin == ticketId));
+
+        allow update: if signedIn() && validTicket(request.resource.data) && (
+          (ownsShop(shopId) && request.resource.data.number == resource.data.number)
+          || (resource.data.uid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'doneAt'])
+            && resource.data.status == 'waiting'
+            && request.resource.data.status == 'left'
+            && getAfter(shopPath(shopId)).data.lastLeave == ticketId));
+
+        allow delete: if ownsShop(shopId);
+      }
+
+      // A summary of each finished day, for the owner's chart
+      match /days/{day} {
+        allow read, delete: if ownsShop(shopId);
+        allow create, update: if ownsShop(shopId)
+          && request.resource.data.keys().hasOnly(['served', 'noShows', 'left', 'avgWait', 'avgService'])
+          && request.resource.data.served is int && request.resource.data.noShows is int && request.resource.data.left is int
+          && request.resource.data.avgWait is number && request.resource.data.avgService is number;
+      }
+    }
+
+    // Join codes: anyone can look one up (that's what the QR code does), only the owner makes them
+    match /codes/{code} {
+      allow get: if true;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['shopId'])
+        && getAfter(shopPath(request.resource.data.shopId)).data.ownerId == request.auth.uid
+        && getAfter(shopPath(request.resource.data.shopId)).data.code == code;
+      allow delete: if signedIn() && get(shopPath(resource.data.shopId)).data.ownerId == request.auth.uid;
+    }
+  }
+}
